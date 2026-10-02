@@ -1,0 +1,145 @@
+GVR-LAB-MIB DEFINITIONS ::= BEGIN
+
+--
+-- A tiny, deliberately simple private MIB for the GVR SNMP lab.
+--
+-- NOTE: 99999 is NOT a real IANA Private Enterprise Number registration
+-- for this course. A real organisation must request its own PEN at
+-- https://www.iana.org/assignments/enterprise-numbers/ and use it here.
+--
+-- Resulting OID tree:
+--
+--   iso(1).org(3).dod(6).internet(1).private(4).enterprises(1)
+--   +- gvrLab(99999)                            1.3.6.1.4.1.99999
+--       +- gvrLabNotifications(0)               1.3.6.1.4.1.99999.0
+--       |   +- gvrLabTempAlarm(1)               1.3.6.1.4.1.99999.0.1
+--       +- gvrLabObjects(1)                     1.3.6.1.4.1.99999.1
+--           +- gvrLabInfo(1)                    (scalars)
+--           |   +- gvrLabName(1)          .0    read-only
+--           |   +- gvrLabCourse(2)        .0    read-only
+--           |   +- gvrLabStudent(3)       .0    read-write
+--           +- gvrLabRoomTable(2)               (table)
+--               +- gvrLabRoomEntry(1)           (row, INDEX gvrLabRoomIndex)
+--                   +- gvrLabRoomIndex(1)       not-accessible
+--                   +- gvrLabRoomName(2)        read-only
+--                   +- gvrLabRoomTemp(3)        read-only
+--                   +- gvrLabRoomStatus(4)      read-only
+--
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE,
+    Integer32, enterprises
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+gvrLab MODULE-IDENTITY
+    LAST-UPDATED "202610010000Z"
+    ORGANIZATION "GVR - Gestao e Virtualizacao de Redes"
+    CONTACT-INFO "Course teaching staff"
+    DESCRIPTION
+        "Example private MIB used to introduce MIB syntax, the OID
+         tree, scalar objects, conceptual tables and notifications."
+    REVISION     "202610010000Z"
+    DESCRIPTION  "Initial version."
+    ::= { enterprises 99999 }
+
+gvrLabNotifications OBJECT IDENTIFIER ::= { gvrLab 0 }
+gvrLabObjects       OBJECT IDENTIFIER ::= { gvrLab 1 }
+gvrLabInfo          OBJECT IDENTIFIER ::= { gvrLabObjects 1 }
+
+--
+-- Scalars: exactly one instance each, instance identifier is ".0"
+--
+
+gvrLabName OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..64))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Human readable name of this lab agent."
+    ::= { gvrLabInfo 1 }
+
+gvrLabCourse OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..64))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Course this agent belongs to."
+    ::= { gvrLabInfo 2 }
+
+gvrLabStudent OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..64))
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Name of the student currently using the lab.
+                 Writable with an SNMP SET."
+    ::= { gvrLabInfo 3 }
+
+--
+-- Conceptual table: rows are identified by gvrLabRoomIndex.
+-- Instance OID = <column OID>.<index value>
+--   e.g. gvrLabRoomTemp.2 = 1.3.6.1.4.1.99999.1.2.1.3.2
+--
+
+gvrLabRoomTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF GvrLabRoomEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Rooms monitored by the lab agent."
+    ::= { gvrLabObjects 2 }
+
+gvrLabRoomEntry OBJECT-TYPE
+    SYNTAX      GvrLabRoomEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "One row per monitored room."
+    INDEX       { gvrLabRoomIndex }
+    ::= { gvrLabRoomTable 1 }
+
+GvrLabRoomEntry ::= SEQUENCE {
+    gvrLabRoomIndex   Integer32,
+    gvrLabRoomName    DisplayString,
+    gvrLabRoomTemp    Integer32,
+    gvrLabRoomStatus  INTEGER
+}
+
+gvrLabRoomIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..255)
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Row index. Not readable: it is encoded in the OID."
+    ::= { gvrLabRoomEntry 1 }
+
+gvrLabRoomName OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..32))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Room name."
+    ::= { gvrLabRoomEntry 2 }
+
+gvrLabRoomTemp OBJECT-TYPE
+    SYNTAX      Integer32
+    UNITS       "decidegrees Celsius"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Room temperature in tenths of a degree Celsius."
+    ::= { gvrLabRoomEntry 3 }
+
+gvrLabRoomStatus OBJECT-TYPE
+    SYNTAX      INTEGER { ok(1), warning(2), critical(3) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Room status. Enumerated INTEGER: the wire carries the
+                 number, the MIB gives it a name."
+    ::= { gvrLabRoomEntry 4 }
+
+--
+-- Notification (trap / inform)
+--
+
+gvrLabTempAlarm NOTIFICATION-TYPE
+    OBJECTS     { gvrLabRoomName, gvrLabRoomTemp }
+    STATUS      current
+    DESCRIPTION "Sent when a room temperature crosses a threshold."
+    ::= { gvrLabNotifications 1 }
+
+END

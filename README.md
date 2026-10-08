@@ -163,7 +163,7 @@ docker exec manager ping -c 3 agent
 * Q2.1 — Why does `agent/entrypoint.sh` wait for `eth0` before starting
   `snmpd`? What would you lose if it didn't wait? (Hint: `trap2sink`.)
 * Q2.2 — Why does `lab.sh` start the manager *before* the agent?
-* Q2.3 — How many interfaces does the agent have? Keep the answer for §3.4.
+* Q2.3 — How many interfaces does the agent have? Keep the answer for §3.2.
 
 ### 2.2 Where is the veth? Namespaces from the host's point of view
 
@@ -177,7 +177,11 @@ A container is a set of ordinary Linux processes, each placed in its own
 | `mnt` | the filesystem tree |
 | `uts` | hostname |
 | `user` | UIDs/GIDs and *privileges* (capabilities) |
-| `ipc`, `cgroup`, ... | ... |
+| `time` | the boot and monotonic clocks (Docker does not use it) |
+| `ipc`, `cgroup` | System V IPC, the view of the cgroup tree |
+
+What is **not** in that list is just as important: **the kernel itself**.
+Every container on a machine runs on the same, single kernel.
 
 A network interface belongs to **exactly one network namespace** at a
 time. `lab.sh` creates the veth inside the agent's namespace and moves
@@ -209,8 +213,14 @@ PM=$(docker inspect -f '{{.State.Pid}}' manager)
 readlink /proc/self/ns/net                # the host shell's netns
 sudo readlink /proc/$PA/ns/net            # agent: a different number
 sudo readlink /proc/$PM/ns/net            # manager: a third number
+sudo ls -l /proc/$PA/ns/                  # all the agent's namespaces at once
 sudo lsns -t net                          # every network namespace on the machine
+ps -o pid,user,cmd -p $PA                 # snmpd, seen from the host
 ```
+
+Inside the container, `snmpd` is PID 1 and runs as `root`. From the host
+it has an ordinary PID, and with Docker its user really is the host's
+`root`, because Docker does not use a user namespace.
 
 **3. Look inside a namespace from the host.** `nsenter -n` enters only
 the *network* namespace and runs the **host's** `ip` binary there:
@@ -299,6 +309,30 @@ docker exec manager sh -c 'ping -c1 agent >/dev/null; ip neigh'   # ... learned 
   the one used in this lab. (This needs Docker Engine. Rootless Podman's
   default network runs a user-space stack, pasta/slirp4netns, so no veth
   appears on the host.)
+* Q2.8 — **What does the agent know about the world?** From the manager:
+  ```sh
+  snmpget -v2c -c public agent sysName.0 sysDescr.0 sysUpTime.0 \
+          HOST-RESOURCES-MIB::hrSystemUptime.0 HOST-RESOURCES-MIB::hrSystemProcesses.0
+  ```
+  and on the host: `hostname`, `uname -a`, `uptime`,
+  `ps -e --no-headers | wc -l`. For each value the agent reports, does it
+  describe the **container** or the **host**? Explain each answer with
+  the namespace table. (Hint: `sysDescr` mixes both.) If you ran an SNMP
+  agent in a container to monitor a server, what would it get wrong?
+* Q2.9 — **Build a namespace without Docker.** On the host:
+  ```bash
+  sudo unshare --uts --net --pid --fork --mount-proc sh
+  hostname cave; hostname        # renamed... only in here
+  ip link                        # what is there, and in what state?
+  ps                             # which PID is your shell?
+  exit
+  hostname                       # and out here?
+  ```
+  Which namespaces did that command create? Compared with the agent
+  container, what is still missing: its own filesystem, resource limits,
+  a network link? Bonus: `sudo unshare --time --boottime 315360000 --fork
+  uptime`. If Docker put the agent in a time namespace like this one,
+  how would `hrSystemUptime.0` in Q2.8 change?
 
 ### 2.3 Capturing SNMP traffic with Wireshark
 

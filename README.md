@@ -27,15 +27,47 @@ to learn two things:
 
 ## 0. Requirements
 
-* **Linux with Docker Engine** (recommended). Your user should be in the
-  `docker` group, or run the commands with `sudo`.
-* Docker Desktop (macOS/Windows) should also work, because the veth is
-  created *inside* Docker's VM by a helper container. This setup is tested
-  on Linux only.
-* Podman with `podman-docker` also works, rootless included:
-  `DOCKER=podman ./lab.sh ...` or just `./lab.sh ...`.
+The reference setup for this course is **Ubuntu on WSL2 with Docker
+Engine installed inside Ubuntu** (`docker-ce` from `apt`). A native Linux
+machine with Docker Engine behaves the same way.
+
 * Internet access for the first build (it pulls `alpine:3.20` and the
   `net-snmp` packages).
+* Other setups: Docker Desktop (Windows/macOS) runs `lab.sh` fine, but
+  the host-side commands in §2.1/§2.2 need the *host shell* described in
+  §2.2. Podman (`podman-docker`, rootless included) also works.
+
+### 0.1 Pre-flight check (Ubuntu on WSL2)
+
+Run these in your Ubuntu terminal before the class:
+
+```bash
+wsl.exe -l -v                      # your distro must show VERSION 2 (WSL1 cannot run containers)
+docker info --format '{{.OperatingSystem}}'
+                                   # must print "Ubuntu ...". If it prints "Docker Desktop",
+                                   # the containers run in Docker Desktop's VM, not in Ubuntu
+                                   # (see the host-shell note in §2.2)
+docker run --rm hello-world        # the daemon is running and you can use it
+```
+
+If `docker` only works with `sudo`, add yourself to the `docker` group
+(`sudo usermod -aG docker $USER`). Then, in PowerShell, run
+`wsl --shutdown` and reopen Ubuntu.
+
+Two WSL pitfalls:
+
+* **Clone the repository inside WSL** (`cd ~ && git clone ...`), not in
+  `/mnt/c/...`. Builds are much faster there, and files keep their Linux
+  permissions.
+* **Line endings.** If the files get Windows (CRLF) line endings, for
+  example by editing them with a Windows editor or cloning with Git for
+  Windows, the scripts fail with confusing errors:
+  `/usr/bin/env: 'bash\r': No such file or directory` for `lab.sh`, or
+  `exec /entrypoint.sh: no such file or directory` when the agent starts.
+  The repository's `.gitattributes` forces LF on clone. To repair a
+  broken copy: `sed -i 's/\r$//' lab.sh */entrypoint.sh` and then
+  `./lab.sh build`. In VS Code, edit the files through the WSL
+  extension (`code .` from Ubuntu).
 
 ## 1. Repository layout
 
@@ -132,6 +164,141 @@ docker exec manager ping -c 3 agent
   `snmpd`? What would you lose if it didn't wait? (Hint: `trap2sink`.)
 * Q2.2 — Why does `lab.sh` start the manager *before* the agent?
 * Q2.3 — How many interfaces does the agent have? Keep the answer for §3.4.
+
+### 2.2 Where is the veth? Namespaces from the host's point of view
+
+A container is a set of ordinary Linux processes, each placed in its own
+**namespaces**. Each namespace type isolates one kind of resource:
+
+| Namespace | Isolates |
+|---|---|
+| `net` | interfaces, IP addresses, routes, ARP table, sockets/ports |
+| `pid` | process IDs |
+| `mnt` | the filesystem tree |
+| `uts` | hostname |
+| `user` | UIDs/GIDs and *privileges* (capabilities) |
+| `ipc`, `cgroup`, ... | ... |
+
+A network interface belongs to **exactly one network namespace** at a
+time. `lab.sh` creates the veth inside the agent's namespace and moves
+the other end into the manager's, so **neither end is in the host's
+namespace**:
+
+```
+  host network namespace          agent netns            manager netns
+  ----------------------          -----------            -------------
+  lo                              lo                     lo
+  eth0 / wlan0 (real NICs)        eth0 (ifindex 2) <---> eth0 (ifindex 2)
+  docker0 ...                      10.0.0.1/30   veth     10.0.0.2/30
+  (no veth here!)
+```
+
+**1. The host does not see it:**
+
+```bash
+ip link                                   # on the host: no 10.0.0.x, no veth
+```
+
+**2. But the namespaces are there.** Every process shows its namespaces
+in `/proc/<pid>/ns/`, and two processes are in the same namespace when
+they show the same inode number:
+
+```bash
+PA=$(docker inspect -f '{{.State.Pid}}' agent)
+PM=$(docker inspect -f '{{.State.Pid}}' manager)
+readlink /proc/self/ns/net                # the host shell's netns
+sudo readlink /proc/$PA/ns/net            # agent: a different number
+sudo readlink /proc/$PM/ns/net            # manager: a third number
+sudo lsns -t net                          # every network namespace on the machine
+```
+
+**3. Look inside a namespace from the host.** `nsenter -n` enters only
+the *network* namespace and runs the **host's** `ip` binary there:
+
+```bash
+sudo nsenter -t $PA -n ip -d link show eth0      # "veth", "eth0@if2", "link-netnsid"
+sudo nsenter -t $PM -n ip -br addr
+```
+
+**4. Why is `ip netns list` empty?** `ip netns` only knows namespaces
+that have a *name*: a bind mount in `/run/netns/`. Docker and Podman
+never create one. You can name a container's namespace yourself:
+
+```bash
+sudo ip netns attach agent   $PA
+sudo ip netns attach manager $PM
+ip netns list
+sudo ip netns exec agent ip -br addr
+sudo ip -all netns exec ip -br link show eth0    # run in every named netns
+sudo ip netns delete agent; sudo ip netns delete manager   # removes only the names
+```
+
+**5. Prove that the two ends belong together.** In each namespace,
+`ifindex` is the interface's own number and `iflink` is its peer's
+number. `@if2` in `ip link` means "my peer is ifindex 2 *in the other
+namespace*", not "in this namespace":
+
+```bash
+docker exec agent   cat /sys/class/net/eth0/ifindex /sys/class/net/eth0/iflink
+docker exec manager cat /sys/class/net/eth0/ifindex /sys/class/net/eth0/iflink
+docker exec agent   cat /sys/class/net/eth0/address  # agent's MAC ...
+docker exec manager sh -c 'ping -c1 agent >/dev/null; ip neigh'   # ... learned by the manager
+```
+
+> **`ip` vs `iplink`.** The images are Alpine Linux, whose basic commands
+> come from **BusyBox**, a single small binary that implements around 300
+> utilities. `ip` is the real iproute2. `iplink`, `ipaddr` and `iproute`
+> are BusyBox versions. BusyBox ignores `link-netnsid` and prints a
+> misleading `eth0@eth0`. Always use `ip link`.
+
+> **No `sudo`, or Docker Desktop?** With Docker
+> Desktop, the real host of the containers is Docker's VM, not your
+> machine or your WSL distro. Open a **host shell** there: a throw-away
+> privileged container that shares the VM's PID namespace (`--pid host`)
+> and network namespace (`--network host`). This is the same trick
+> `lab.sh` uses to plug the veth.
+> ```bash
+> PA=$(docker inspect -f '{{.State.Pid}}' agent)
+> PM=$(docker inspect -f '{{.State.Pid}}' manager)
+> docker run -it --rm --privileged --pid host --network host \
+>        -e PA=$PA -e PM=$PM --entrypoint sh gvr-snmp-manager
+> ```
+> Inside it, run steps 1–4 above **without `sudo`**: `ip link`,
+> `readlink /proc/$PA/ns/net` (BusyBox `readlink` takes one file per
+> call), `lsns -t net`, `nsenter -t $PA -n ip -d link`. Q2.7 also works
+> there: `ip link show master docker0`.
+
+> **Rootless Podman: `podman unshare` is not enough.** Rootless Podman
+> adds a **user namespace**: both containers share one user namespace
+> (where the user is "root"), and each has its own network namespace
+> *inside* it. `podman unshare` enters only the user namespace. You get
+> privileges there, but you are still in the host's network namespace,
+> so `podman unshare ip link` shows the host's interfaces. Enter both:
+> ```bash
+> PA=$(podman inspect -f '{{.State.Pid}}' agent)
+> nsenter -t $PA -n ip link                      # Operation not permitted
+> podman unshare ip link                         # user ns only -> host interfaces
+> podman unshare nsenter -t $PA -n ip -d link    # user ns + net ns -> the veth
+> podman unshare readlink /proc/$PA/ns/user /proc/$PA/ns/net
+> ```
+> `ip netns exec` does not work rootless (it cannot mount `/sys`). Use
+> `nsenter` instead. With Docker (rootful) the containers use the host's
+> user namespace, so this case does not arise.
+
+* Q2.4 — Why does `ip link` on the host not show the veth at all? What
+  would you have to do to make one end appear on the host?
+* Q2.5 — `nsenter -t $PA -n ip link` shows the agent's interfaces, but
+  `nsenter -t $PA -n cat /etc/hostname` prints the **host's** hostname.
+  Why? Which `nsenter` flag would change that?
+* Q2.6 — After `sudo ip netns delete agent`, is the agent's network
+  gone? What actually destroys a network namespace (and the veth)?
+* Q2.7 — Start a container on Docker's default network
+  (`docker run -d --name tmp alpine sleep 600`) and run `ip link` on the
+  host again. What appeared, and where is its peer? (`ip link show master
+  docker0`.) Clean up with `docker rm -f tmp`. Compare that design with
+  the one used in this lab. (This needs Docker Engine. Rootless Podman's
+  default network runs a user-space stack, pasta/slirp4netns, so no veth
+  appears on the host.)
 
 ---
 
@@ -522,7 +689,10 @@ snmpget -v3 -l authPriv -u gvrUser -a SHA -A wrongPassword -x AES -X gvrPrivPass
 | `Unknown Object Identifier` | Load the MIB (`-m +GVR-LAB-MIB`) or use the numeric OID |
 | `Bad operator` / parse errors when loading a MIB | Syntax error in the MIB file, usually a `--` inside a comment |
 | `Emulate Docker CLI using podman` messages | Harmless (podman-docker). `sudo touch /etc/containers/nodocker` silences them |
-| Docker Desktop: `lab.sh up` fails in `nsenter` | Use a Linux VM / WSL2 with Docker Engine |
+| Docker Desktop: `lab.sh up` fails in `nsenter` | Use Ubuntu on WSL2 with Docker Engine installed inside Ubuntu (§0.1) |
+| `/usr/bin/env: 'bash\r'` or `exec /entrypoint.sh: no such file or directory` | Windows line endings: `sed -i 's/\r$//' lab.sh */entrypoint.sh`, then `./lab.sh build` (§0.1) |
+| WSL: `sudo nsenter -t $PA ...` fails or shows the wrong process | `docker info --format '{{.OperatingSystem}}'` says "Docker Desktop": use the host shell from §2.2 |
+| `./lab.sh: Permission denied` | `chmod +x lab.sh`, or run `bash lab.sh ...`. Better: clone inside WSL, not in `/mnt/c` |
 
 ## 8. Net-SNMP option cheat sheet
 

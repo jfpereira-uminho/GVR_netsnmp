@@ -300,6 +300,129 @@ docker exec manager sh -c 'ping -c1 agent >/dev/null; ip neigh'   # ... learned 
   default network runs a user-space stack, pasta/slirp4netns, so no veth
   appears on the host.)
 
+### 2.3 Capturing SNMP traffic with Wireshark
+
+The SNMP packets exist only on the veth, inside the containers' network
+namespaces (§2.2). Wireshark on Windows only sees Windows' own
+interfaces, so it cannot capture there directly. Instead, `tcpdump`
+(already in the images) captures on the manager's `eth0` and passes the
+packets to Wireshark, either **as a file** (offline) or **through a
+pipe** (live). Both ends of the veth see the same packets, so capturing
+on the manager is enough: it sees requests, responses *and* traps.
+
+Install Wireshark on Windows (<https://www.wireshark.org>). Then, in
+Ubuntu, define a shortcut to it:
+
+```bash
+WS="/mnt/c/Program Files/Wireshark/Wireshark.exe"
+```
+
+(On native Linux, or Ubuntu with WSLg, a Linux Wireshark works too:
+use `WS=wireshark`.)
+
+#### Offline: capture to a file, then open it
+
+```bash
+# Terminal 1: capture SNMP (161) and notifications (162). Ctrl-C to stop.
+docker exec -it manager tcpdump -ni eth0 -w /tmp/snmp.pcap 'udp port 161 or udp port 162'
+
+# Terminal 2: generate traffic (snmpget, snmpwalk, snmptrap, ...)
+
+# Copy the file out of the container and open it in Windows Wireshark
+docker cp manager:/tmp/snmp.pcap ~/snmp.pcap
+"$WS" "$(wslpath -w ~/snmp.pcap)"
+```
+
+`wslpath -w` converts the Linux path to the Windows path Wireshark needs
+(`\\wsl.localhost\Ubuntu\home\...`). You can also run `explorer.exe ~`
+and double-click the file.
+
+#### Live: pipe tcpdump into Wireshark
+
+```bash
+docker exec manager tcpdump -ni eth0 -U -w - 'udp port 161 or udp port 162' | "$WS" -k -i -
+```
+
+| Option | Why |
+|---|---|
+| `-w -` | tcpdump writes pcap to stdout instead of a file |
+| `-U` | flush every packet immediately (otherwise Wireshark waits for a full buffer) |
+| `-k -i -` | Wireshark starts capturing at once, reading from stdin |
+| **no `-t`** in `docker exec` | a terminal (tty) mangles the binary stream, and Wireshark reports `Frame ... too long` |
+
+Packets appear in Wireshark as you run commands in another terminal.
+Stop with Ctrl-C in the terminal running the pipe.
+
+#### Show MIB names instead of numbers
+
+Wireshark is like `snmpget`: it shows names only if it has the MIB
+files. The manager already has all of them, including `GVR-LAB-MIB`, so
+copy them out:
+
+```bash
+docker cp manager:/usr/share/snmp/mibs ~/gvr-mibs
+wslpath -w ~/gvr-mibs          # copy this path
+```
+
+In Wireshark, open **Edit → Preferences → Name Resolution**:
+
+1. Tick **Enable OID resolution**.
+2. **SMI (MIB and PIB) paths → Edit… → +**, and paste the path.
+3. **SMI (MIB and PIB) modules → Edit… → +**, and add `SNMPv2-MIB`,
+   `IF-MIB` and `GVR-LAB-MIB` (one per line).
+4. **Restart Wireshark.** The MIBs are only loaded at startup.
+
+Before / after, for the same packet:
+
+```
+get-response 1.3.6.1.4.1.99999.1.2.1.3.2           (no MIBs)
+get-response GVR-LAB-MIB::gvrLabRoomTemp.2         (MIBs loaded)
+```
+
+#### Decrypt SNMPv3
+
+Open **Edit → Preferences → Protocols → SNMP → Users Table → Edit… → +**:
+
+| Engine ID | Username | Authentication model | Password | Privacy protocol | Privacy password |
+|---|---|---|---|---|---|
+| *(empty = any)* | `gvrUser` | `SHA1` | `gvrAuthPass` | `AES` | `gvrPrivPass` |
+
+The `encryptedPDU: privKey Unknown` lines turn into a normal
+`get-request` / `get-response`.
+
+#### Useful display filters
+
+| Filter | Shows |
+|---|---|
+| `snmp` | all SNMP |
+| `udp.port == 162` | notifications only (traps and informs, plus inform acknowledgements) |
+| `snmp.data == 5` | GETBULK requests (0 get, 1 getnext, 2 response, 3 set, 5 getbulk, 6 inform, 7 trap, 8 report) |
+| `snmp.community == "public"` | v1/v2c packets with that community |
+| `snmp.name == 1.3.6.1.2.1.1.5.0` | packets that carry `sysName.0` |
+| `snmp.msgUserName` | SNMPv3 packets |
+
+**Questions** (capture while you do the exercises in §4 and §5):
+
+* W1 — Pick a `get-request` and its `get-response`. Expand
+  *Simple Network Management Protocol*: list every field of the PDU.
+  Which field links the response to its request?
+* W2 — Click the *Object Name* of a GET for `sysName.0` and look at the
+  bytes pane: `06 08 2b 06 01 02 01 01 05 00`. What are `06` and `08`?
+  Why does `1.3` take a single byte (`2b`)? Now find `99999` inside
+  `GVR-LAB-MIB::gvrLabRoomTemp.2`. Why does it take three bytes
+  (`86 8d 1f`)? (Hint: 7 bits per byte, and the high bit means "more
+  bytes follow".)
+* W3 — Open a GETBULK request. Which two fields appear where a GET has
+  `error-status` and `error-index`?
+* W4 — Capture one `snmptrap` and one `snmpinform` (§4.5). Which one
+  gets an answer? What are the first two varbinds of both?
+* W5 — Capture an SNMPv3 GET *before* configuring the Users Table. What
+  can you still read (user name, engine ID, the discovery `Report`)?
+  Then add the user. What does it take to read "encrypted" SNMP, and
+  what does that say about protecting the passwords?
+* W6 — Compare the same packet with and without the MIBs loaded. Did
+  any byte on the wire change?
+
 ---
 
 ## 3. MIBs and the OID tree
